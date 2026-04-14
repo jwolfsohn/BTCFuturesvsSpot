@@ -185,6 +185,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download Binance historical data")
     parser.add_argument("--paper", action="store_true",
                         help="Download 1s data for paper replication (Jan 1-5, 2024)")
+    parser.add_argument("--all", action="store_true",
+                        help="Download extended data: 2020-2024 for multi-regime testing")
     args = parser.parse_args()
 
     if args.paper:
@@ -196,19 +198,23 @@ if __name__ == "__main__":
         download_monthly_funding_rate("BTCUSDT", 2024, 1,
                                       "data/binance/futures/BTCUSDT/fundingRate")
     else:
-        # Default: 1m monthly data for full year 2024
-        print("\nDownloading BTC spot 1m monthly klines (Jan-Dec 2024)...")
-        for year, month in [(2024, m) for m in range(1, 13)]:
+        # --all: 2020-2024, default: 2024 only
+        years = range(2020, 2025) if args.all else [2024]
+        months_list = [(y, m) for y in years for m in range(1, 13)]
+
+        label = "2020-2024" if args.all else "2024"
+        print(f"\nDownloading BTC spot 1m monthly klines ({label})...")
+        for year, month in months_list:
             download_monthly_klines_spot("BTCUSDT", "1m", year, month,
                                          "data/binance/spot/BTCUSDT/1m")
 
-        print("\nDownloading BTC perpetual futures 1m monthly klines (Jan-Dec 2024)...")
-        for year, month in [(2024, m) for m in range(1, 13)]:
+        print(f"\nDownloading BTC perpetual futures 1m monthly klines ({label})...")
+        for year, month in months_list:
             download_monthly_klines_futures("BTCUSDT", "1m", year, month,
                                             "data/binance/futures/BTCUSDT/1m")
 
-        print("\nDownloading BTC funding rate (Jan-Dec 2024)...")
-        for year, month in [(2024, m) for m in range(1, 13)]:
+        print(f"\nDownloading BTC funding rate ({label})...")
+        for year, month in months_list:
             download_monthly_funding_rate("BTCUSDT", year, month,
                                           "data/binance/futures/BTCUSDT/fundingRate")
 

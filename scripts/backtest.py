@@ -1530,6 +1530,450 @@ def backtest_p_mom(
                                    "dp_red_threshold": dp_red_threshold})
 
 
+# ── P_MOM ablation variants ──────────────────────────────────────────────────
+# All four wrap the baseline P_MOM logic with one regime-protection idea each.
+# Goal: test whether cheap, well-documented filters make momentum all-weather,
+# and isolate IPES's marginal value (P_MOM_F).
+
+
+def backtest_p_mom_a(
+    signals: list,
+    ema_periods: int = 672,
+    ema_band_pct: float = 0.005,
+    sma_periods: int = 19200,
+    tx_cost_bps: float = DEFAULT_TX_COST_BPS,
+    leverage: int = 3,
+    E_threshold_green: float = 0.3,
+    E_threshold_red: float = 0.8,
+    dp_red_threshold: float = 1.5,
+    name: str = "P_MOM_A",
+) -> PortfolioResult:
+    """P_MOM + 200-day SMA trend filter.
+
+    Only long when price > SMA_200d (Moskowitz/Ooi/Pedersen time-series
+    momentum regime gate). 19,200 signals at 15-min step = 200 days.
+    """
+    tc_one_way = round_trip_cost(tx_cost_bps) / 2
+    trades = []
+    equity = [1.0]
+    timestamps = [signals[0].timestamp if signals else pd.Timestamp.now(tz="UTC")]
+
+    prices = [s.prices[1] for s in signals]
+    alpha = 2.0 / (ema_periods + 1)
+
+    in_position = False
+    direction = 0
+    entry_price = 0.0
+    entry_time = None
+    entry_reason = ""
+    ema = prices[0] if prices else 0.0
+    sma_buf = collections.deque(maxlen=sma_periods)
+
+    for i, s in enumerate(signals):
+        ema = alpha * s.prices[1] + (1 - alpha) * ema
+        sma_buf.append(s.prices[1])
+        if i < max(ema_periods, sma_periods):
+            continue
+
+        price = s.prices[1]
+        sma = sum(sma_buf) / len(sma_buf)
+        trend_up = price > sma
+
+        ipes_red = (s.E[0] > E_threshold_red or s.E[1] > E_threshold_red
+                    or s.d_P[0] > dp_red_threshold or s.d_P[1] > dp_red_threshold)
+        ipes_green = (s.E[0] < E_threshold_green and s.E[1] < E_threshold_green)
+
+        ema_upper = ema * (1 + ema_band_pct)
+        ema_lower = ema * (1 - ema_band_pct)
+
+        if in_position:
+            exit_reason = None
+            if ipes_red:
+                exit_reason = f"ipes_red E=[{s.E[0]:.2f},{s.E[1]:.2f}]"
+            elif not trend_up:
+                exit_reason = f"sma_break price={price:.0f} sma={sma:.0f}"
+            elif price < ema_lower:
+                exit_reason = f"ema_cross_below price={price:.0f} ema={ema:.0f}"
+
+            if exit_reason:
+                exit_price = s.prices[1]
+                pnl_gross = direction * (exit_price - entry_price) / entry_price * leverage
+                pnl_net = pnl_gross + tc_one_way * leverage
+                trades.append(Trade(
+                    entry_time=entry_time, exit_time=s.timestamp,
+                    entry_spread=entry_price, exit_spread=exit_price,
+                    direction=direction, entry_reason=entry_reason,
+                    exit_reason=exit_reason,
+                    pnl_gross=pnl_gross, pnl_net=pnl_net,
+                ))
+                equity.append(equity[-1] * (1 + pnl_net))
+                timestamps.append(s.timestamp)
+                in_position = False
+
+        if not in_position and trend_up and price > ema_upper and not ipes_red:
+            if ipes_green or not s.cointegration_holds:
+                in_position = True
+                direction = 1
+                entry_price = s.prices[1]
+                entry_time = s.timestamp
+                regime = "green" if ipes_green else "no_coint"
+                entry_reason = (f"sma_ok_ema_long price={price:.0f} "
+                                f"sma={sma:.0f} ema={ema:.0f} regime={regime}")
+                equity.append(equity[-1] * (1 + tc_one_way * leverage))
+                timestamps.append(s.timestamp)
+
+    if in_position and signals:
+        s = signals[-1]
+        exit_price = s.prices[1]
+        pnl_gross = direction * (exit_price - entry_price) / entry_price * leverage
+        pnl_net = pnl_gross + tc_one_way * leverage
+        trades.append(Trade(
+            entry_time=entry_time, exit_time=s.timestamp,
+            entry_spread=entry_price, exit_spread=exit_price,
+            direction=direction, entry_reason=entry_reason,
+            exit_reason="end_of_period",
+            pnl_gross=pnl_gross, pnl_net=pnl_net,
+        ))
+        equity.append(equity[-1] * (1 + pnl_net))
+        timestamps.append(s.timestamp)
+
+    eq_series = pd.Series(equity, index=timestamps[:len(equity)])
+    return PortfolioResult(name=name, trades=trades, equity_curve=eq_series,
+                           params={"ema_periods": ema_periods,
+                                   "ema_band_pct": ema_band_pct,
+                                   "sma_periods": sma_periods,
+                                   "leverage": leverage,
+                                   "tx_cost_bps": tx_cost_bps})
+
+
+def backtest_p_mom_c(
+    signals: list,
+    ema_periods: int = 672,
+    ema_band_pct: float = 0.005,
+    target_vol_ann: float = 0.40,
+    vol_lookback: int = 2880,
+    max_leverage: float = 3.0,
+    min_leverage: float = 1.0,
+    tx_cost_bps: float = DEFAULT_TX_COST_BPS,
+    E_threshold_green: float = 0.3,
+    E_threshold_red: float = 0.8,
+    dp_red_threshold: float = 1.5,
+    name: str = "P_MOM_C",
+) -> PortfolioResult:
+    """P_MOM + vol-targeted leverage.
+
+    Scales leverage by inverse realized volatility to target `target_vol_ann`
+    portfolio volatility. Lookback 2,880 signals at 15-min step = 30 days.
+    Annualization factor for 15-min returns: sqrt(35,040).
+    """
+    tc_one_way_bps = round_trip_cost(tx_cost_bps) / 2
+    trades = []
+    equity = [1.0]
+    timestamps = [signals[0].timestamp if signals else pd.Timestamp.now(tz="UTC")]
+
+    alpha = 2.0 / (ema_periods + 1)
+    ann_factor = np.sqrt(35040.0)  # 15-min bars per year
+
+    log_prices = np.log([s.prices[1] for s in signals]) if signals else np.array([])
+    log_returns = np.diff(log_prices, prepend=log_prices[:1]) if len(log_prices) else np.array([])
+
+    in_position = False
+    entry_price = 0.0
+    entry_time = None
+    entry_reason = ""
+    entry_leverage = 1.0
+    ema = signals[0].prices[1] if signals else 0.0
+
+    for i, s in enumerate(signals):
+        ema = alpha * s.prices[1] + (1 - alpha) * ema
+        if i < max(ema_periods, vol_lookback):
+            continue
+
+        window = log_returns[i - vol_lookback + 1:i + 1]
+        realized_vol_ann = float(np.std(window) * ann_factor)
+        if realized_vol_ann <= 1e-8:
+            lev = max_leverage
+        else:
+            lev = float(np.clip(target_vol_ann / realized_vol_ann,
+                                min_leverage, max_leverage))
+
+        price = s.prices[1]
+        ipes_red = (s.E[0] > E_threshold_red or s.E[1] > E_threshold_red
+                    or s.d_P[0] > dp_red_threshold or s.d_P[1] > dp_red_threshold)
+        ipes_green = (s.E[0] < E_threshold_green and s.E[1] < E_threshold_green)
+
+        ema_upper = ema * (1 + ema_band_pct)
+        ema_lower = ema * (1 - ema_band_pct)
+
+        if in_position:
+            exit_reason = None
+            if ipes_red:
+                exit_reason = f"ipes_red E=[{s.E[0]:.2f},{s.E[1]:.2f}]"
+            elif price < ema_lower:
+                exit_reason = f"ema_cross_below price={price:.0f} ema={ema:.0f}"
+
+            if exit_reason:
+                exit_price = s.prices[1]
+                pnl_gross = (exit_price - entry_price) / entry_price * entry_leverage
+                pnl_net = pnl_gross + tc_one_way_bps * entry_leverage
+                trades.append(Trade(
+                    entry_time=entry_time, exit_time=s.timestamp,
+                    entry_spread=entry_price, exit_spread=exit_price,
+                    direction=1, entry_reason=entry_reason,
+                    exit_reason=exit_reason,
+                    pnl_gross=pnl_gross, pnl_net=pnl_net,
+                ))
+                equity.append(equity[-1] * (1 + pnl_net))
+                timestamps.append(s.timestamp)
+                in_position = False
+
+        if not in_position and price > ema_upper and not ipes_red:
+            if ipes_green or not s.cointegration_holds:
+                in_position = True
+                entry_price = s.prices[1]
+                entry_time = s.timestamp
+                entry_leverage = lev
+                regime = "green" if ipes_green else "no_coint"
+                entry_reason = (f"voltgt_long price={price:.0f} ema={ema:.0f} "
+                                f"vol={realized_vol_ann:.2f} lev={lev:.2f} "
+                                f"regime={regime}")
+                equity.append(equity[-1] * (1 + tc_one_way_bps * entry_leverage))
+                timestamps.append(s.timestamp)
+
+    if in_position and signals:
+        s = signals[-1]
+        exit_price = s.prices[1]
+        pnl_gross = (exit_price - entry_price) / entry_price * entry_leverage
+        pnl_net = pnl_gross + tc_one_way_bps * entry_leverage
+        trades.append(Trade(
+            entry_time=entry_time, exit_time=s.timestamp,
+            entry_spread=entry_price, exit_spread=exit_price,
+            direction=1, entry_reason=entry_reason,
+            exit_reason="end_of_period",
+            pnl_gross=pnl_gross, pnl_net=pnl_net,
+        ))
+        equity.append(equity[-1] * (1 + pnl_net))
+        timestamps.append(s.timestamp)
+
+    eq_series = pd.Series(equity, index=timestamps[:len(equity)])
+    return PortfolioResult(name=name, trades=trades, equity_curve=eq_series,
+                           params={"ema_periods": ema_periods,
+                                   "ema_band_pct": ema_band_pct,
+                                   "target_vol_ann": target_vol_ann,
+                                   "vol_lookback": vol_lookback,
+                                   "max_leverage": max_leverage,
+                                   "min_leverage": min_leverage,
+                                   "tx_cost_bps": tx_cost_bps})
+
+
+def backtest_p_mom_d(
+    signals: list,
+    ema_periods: int = 672,
+    ema_band_pct: float = 0.005,
+    leverage: int = 3,
+    dd_halve: float = 0.10,
+    dd_halt: float = 0.20,
+    recover_within: float = 0.05,
+    tx_cost_bps: float = DEFAULT_TX_COST_BPS,
+    E_threshold_green: float = 0.3,
+    E_threshold_red: float = 0.8,
+    dp_red_threshold: float = 1.5,
+    name: str = "P_MOM_D",
+) -> PortfolioResult:
+    """P_MOM + portfolio-level drawdown circuit breaker.
+
+    Tracks running equity peak; at DD > dd_halve halves leverage, at
+    DD > dd_halt flattens and blocks new entries until equity recovers
+    to within `recover_within` of the peak. Per-portfolio, not per-trade.
+    """
+    tc_one_way = round_trip_cost(tx_cost_bps) / 2
+    trades = []
+    equity = [1.0]
+    timestamps = [signals[0].timestamp if signals else pd.Timestamp.now(tz="UTC")]
+
+    alpha = 2.0 / (ema_periods + 1)
+    ema = signals[0].prices[1] if signals else 0.0
+
+    in_position = False
+    entry_price = 0.0
+    entry_time = None
+    entry_reason = ""
+    entry_leverage = float(leverage)
+    halted = False
+    peak = 1.0
+
+    for i, s in enumerate(signals):
+        ema = alpha * s.prices[1] + (1 - alpha) * ema
+        if i < ema_periods:
+            continue
+
+        eq = equity[-1]
+        peak = max(peak, eq)
+        dd = (eq / peak) - 1.0
+
+        if dd <= -dd_halt:
+            halted = True
+            curr_lev = 0.0
+        elif dd <= -dd_halve:
+            if halted and eq >= peak * (1 - recover_within):
+                halted = False
+            curr_lev = 0.0 if halted else leverage / 2.0
+        else:
+            halted = False
+            curr_lev = float(leverage)
+
+        price = s.prices[1]
+        ipes_red = (s.E[0] > E_threshold_red or s.E[1] > E_threshold_red
+                    or s.d_P[0] > dp_red_threshold or s.d_P[1] > dp_red_threshold)
+        ipes_green = (s.E[0] < E_threshold_green and s.E[1] < E_threshold_green)
+
+        ema_upper = ema * (1 + ema_band_pct)
+        ema_lower = ema * (1 - ema_band_pct)
+
+        if in_position:
+            exit_reason = None
+            if halted:
+                exit_reason = f"dd_halt dd={dd:.2%}"
+            elif ipes_red:
+                exit_reason = f"ipes_red E=[{s.E[0]:.2f},{s.E[1]:.2f}]"
+            elif price < ema_lower:
+                exit_reason = f"ema_cross_below price={price:.0f} ema={ema:.0f}"
+
+            if exit_reason:
+                exit_price = s.prices[1]
+                pnl_gross = (exit_price - entry_price) / entry_price * entry_leverage
+                pnl_net = pnl_gross + tc_one_way * entry_leverage
+                trades.append(Trade(
+                    entry_time=entry_time, exit_time=s.timestamp,
+                    entry_spread=entry_price, exit_spread=exit_price,
+                    direction=1, entry_reason=entry_reason,
+                    exit_reason=exit_reason,
+                    pnl_gross=pnl_gross, pnl_net=pnl_net,
+                ))
+                equity.append(equity[-1] * (1 + pnl_net))
+                timestamps.append(s.timestamp)
+                in_position = False
+
+        if (not in_position and not halted and curr_lev > 0
+                and price > ema_upper and not ipes_red):
+            if ipes_green or not s.cointegration_holds:
+                in_position = True
+                entry_price = s.prices[1]
+                entry_time = s.timestamp
+                entry_leverage = curr_lev
+                regime = "green" if ipes_green else "no_coint"
+                entry_reason = (f"dd_ok_ema_long price={price:.0f} ema={ema:.0f} "
+                                f"dd={dd:.2%} lev={curr_lev:.1f} regime={regime}")
+                equity.append(equity[-1] * (1 + tc_one_way * entry_leverage))
+                timestamps.append(s.timestamp)
+
+    if in_position and signals:
+        s = signals[-1]
+        exit_price = s.prices[1]
+        pnl_gross = (exit_price - entry_price) / entry_price * entry_leverage
+        pnl_net = pnl_gross + tc_one_way * entry_leverage
+        trades.append(Trade(
+            entry_time=entry_time, exit_time=s.timestamp,
+            entry_spread=entry_price, exit_spread=exit_price,
+            direction=1, entry_reason=entry_reason,
+            exit_reason="end_of_period",
+            pnl_gross=pnl_gross, pnl_net=pnl_net,
+        ))
+        equity.append(equity[-1] * (1 + pnl_net))
+        timestamps.append(s.timestamp)
+
+    eq_series = pd.Series(equity, index=timestamps[:len(equity)])
+    return PortfolioResult(name=name, trades=trades, equity_curve=eq_series,
+                           params={"ema_periods": ema_periods,
+                                   "ema_band_pct": ema_band_pct,
+                                   "leverage": leverage,
+                                   "dd_halve": dd_halve,
+                                   "dd_halt": dd_halt,
+                                   "recover_within": recover_within,
+                                   "tx_cost_bps": tx_cost_bps})
+
+
+def backtest_p_mom_f(
+    signals: list,
+    ema_periods: int = 672,
+    ema_band_pct: float = 0.005,
+    tx_cost_bps: float = DEFAULT_TX_COST_BPS,
+    leverage: int = 3,
+    name: str = "P_MOM_F",
+) -> PortfolioResult:
+    """P_MOM ablation: pure EMA crossover, no IPES regime gate.
+
+    Control experiment — does IPES's red/green regime classification
+    actually help momentum, or is it just churn? This strips the filter.
+    """
+    tc_one_way = round_trip_cost(tx_cost_bps) / 2
+    trades = []
+    equity = [1.0]
+    timestamps = [signals[0].timestamp if signals else pd.Timestamp.now(tz="UTC")]
+
+    alpha = 2.0 / (ema_periods + 1)
+    ema = signals[0].prices[1] if signals else 0.0
+
+    in_position = False
+    entry_price = 0.0
+    entry_time = None
+    entry_reason = ""
+
+    for i, s in enumerate(signals):
+        ema = alpha * s.prices[1] + (1 - alpha) * ema
+        if i < ema_periods:
+            continue
+
+        price = s.prices[1]
+        ema_upper = ema * (1 + ema_band_pct)
+        ema_lower = ema * (1 - ema_band_pct)
+
+        if in_position and price < ema_lower:
+            exit_price = s.prices[1]
+            pnl_gross = (exit_price - entry_price) / entry_price * leverage
+            pnl_net = pnl_gross + tc_one_way * leverage
+            trades.append(Trade(
+                entry_time=entry_time, exit_time=s.timestamp,
+                entry_spread=entry_price, exit_spread=exit_price,
+                direction=1, entry_reason=entry_reason,
+                exit_reason=f"ema_cross_below price={price:.0f} ema={ema:.0f}",
+                pnl_gross=pnl_gross, pnl_net=pnl_net,
+            ))
+            equity.append(equity[-1] * (1 + pnl_net))
+            timestamps.append(s.timestamp)
+            in_position = False
+
+        if not in_position and price > ema_upper:
+            in_position = True
+            entry_price = s.prices[1]
+            entry_time = s.timestamp
+            entry_reason = f"ema_long price={price:.0f} ema={ema:.0f}"
+            equity.append(equity[-1] * (1 + tc_one_way * leverage))
+            timestamps.append(s.timestamp)
+
+    if in_position and signals:
+        s = signals[-1]
+        exit_price = s.prices[1]
+        pnl_gross = (exit_price - entry_price) / entry_price * leverage
+        pnl_net = pnl_gross + tc_one_way * leverage
+        trades.append(Trade(
+            entry_time=entry_time, exit_time=s.timestamp,
+            entry_spread=entry_price, exit_spread=exit_price,
+            direction=1, entry_reason=entry_reason,
+            exit_reason="end_of_period",
+            pnl_gross=pnl_gross, pnl_net=pnl_net,
+        ))
+        equity.append(equity[-1] * (1 + pnl_net))
+        timestamps.append(s.timestamp)
+
+    eq_series = pd.Series(equity, index=timestamps[:len(equity)])
+    return PortfolioResult(name=name, trades=trades, equity_curve=eq_series,
+                           params={"ema_periods": ema_periods,
+                                   "ema_band_pct": ema_band_pct,
+                                   "leverage": leverage,
+                                   "tx_cost_bps": tx_cost_bps})
+
+
 def backtest_p_carry(
     signals: list,
     funding_rate: float = 0.0001,
@@ -1699,6 +2143,12 @@ def run_all_portfolios(
     # ── Always-on strategies ───────────────────────────────────────
     # P_MOM -- Momentum with IPES regime filter
     results.append(backtest_p_mom(signals, tx_cost_bps=tx_cost_bps))
+
+    # P_MOM ablation variants (regime-protection research)
+    results.append(backtest_p_mom_a(signals, tx_cost_bps=tx_cost_bps))
+    results.append(backtest_p_mom_c(signals, tx_cost_bps=tx_cost_bps))
+    results.append(backtest_p_mom_d(signals, tx_cost_bps=tx_cost_bps))
+    results.append(backtest_p_mom_f(signals, tx_cost_bps=tx_cost_bps))
 
     # P_CARRY -- Funding rate carry with IPES shield
     # Uses its own higher E_threshold (0.8) and d_sum_threshold (3.0) defaults

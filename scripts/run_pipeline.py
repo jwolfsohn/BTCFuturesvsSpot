@@ -9,8 +9,16 @@ enabling profitable mean-reversion strategies.
 Uses 1-second BTC/USDT spot and perpetual futures from Binance.
 
 Usage:
-    python3 -m scripts.run_pipeline
-    python3 -m scripts.run_pipeline --skip-robustness
+    python3 -m scripts.run_pipeline                   # Full: Part 1 + Part 2 + VECM
+    python3 -m scripts.run_pipeline --fast            # Part 1 only (skip 1s cascades)
+    python3 -m scripts.run_pipeline --no-vecm         # Stub signals, Part 1 only (seconds)
+
+Flags:
+    --fast      Skip Part 2 (1-second cascade deep-dives, Figure 3, price discovery).
+                Keeps the 1-minute multi-year backtest + walk-forward intact.
+    --no-vecm   Do not run the rolling VECM. Build stub signals from raw prices
+                (E=0, d_P=0, cointegration_holds=False) and backtest strategies
+                against them. Implies --fast. Use for rapid strategy iteration.
 
 Outputs:
     results/resultsN.md -- Full results in Markdown (auto-increments)
@@ -18,12 +26,15 @@ Outputs:
 """
 from __future__ import annotations
 
+import argparse
 import re
+import sys
 import time
 import warnings
 from io import StringIO
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # Suppress numpy RuntimeWarnings from VECM numerical edge cases
@@ -35,9 +46,12 @@ from scripts.load_data import (
 from scripts.plot_paper_results import plot_figure3
 from scripts.backtest import (
     run_full_pipeline,
+    run_all_portfolios, results_table,
     backtest_p_mom, backtest_p_carry, backtest_p_dir,
+    backtest_p_mom_a, backtest_p_mom_c, backtest_p_mom_d, backtest_p_mom_f,
     p_mom_sweep, p_carry_sweep, p_dir_sweep,
 )
+from scripts.vecm_ipes import WindowSignals, WINDOW_DEFAULTS
 
 ROOT = Path(__file__).parent.parent
 RESULTS_DIR = ROOT / "results"
@@ -56,6 +70,61 @@ def _next_results_file() -> Path:
 
 
 SWEEP_CSV = RESULTS_DIR / "robustness_sweep.csv"
+
+
+def _build_stub_signals(spot: pd.Series, perp: pd.Series, interval: str) -> list:
+    """Build stub WindowSignals from raw prices without running VECM.
+
+    Matches the cadence of the real pipeline (W warmup, step-sized samples)
+    so downstream backtests see the same number of signals. All IPES/d^P
+    fields are zero and cointegration_holds=False, which forces P_MOM onto
+    its no_coint entry path and keeps P_CARRY/P_DIR's IPES gates inactive.
+    """
+    d = WINDOW_DEFAULTS.get(interval, WINDOW_DEFAULTS["1m"])
+    W, step = d["W"], d["step"]
+    both = pd.concat([spot, perp], axis=1, join="inner").dropna()
+    if len(both) < W + step:
+        return []
+    signals = []
+    zero2 = np.array([0.0, 0.0])
+    for i in range(W - 1, len(both), step):
+        ts = both.index[i]
+        s_price = float(both.iloc[i, 0])
+        p_price = float(both.iloc[i, 1])
+        signals.append(WindowSignals(
+            timestamp=ts,
+            cointegration_holds=False,
+            alpha_signs_opposite=False,
+            d_P=zero2.copy(),
+            E=zero2.copy(),
+            ipes=zero2.copy(),
+            nls=zero2.copy(),
+            pils=zero2.copy(),
+            covis=zero2.copy(),
+            z_trans=0.0, z_perm=0.0, z_spread=0.0, z_coint_resid=0.0,
+            spread=s_price - p_price,
+            prices=np.array([s_price, p_price]),
+            eta_P_last=0.0, eta_T_last=0.0,
+            portmanteau_pvalue=1.0,
+            residuals_stationary=True,
+        ))
+    return signals
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="run_pipeline",
+        description="BTC IPES pipeline: VECM estimation + portfolio backtests.",
+    )
+    p.add_argument("--fast", action="store_true",
+                   help="Skip Part 2 (1-second cascade deep-dives).")
+    p.add_argument("--no-vecm", dest="no_vecm", action="store_true",
+                   help="Skip VECM entirely; use stub signals. Implies --fast.")
+    args = p.parse_args(argv)
+    if args.no_vecm and not args.fast:
+        print("note: --no-vecm implies --fast; skipping Part 2.", file=sys.stderr)
+        args.fast = True
+    return args
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -105,6 +174,10 @@ Instead of using it as a trade signal, we use it to modulate risk across strateg
 | P_AVOID | Spread | IPES Avoid-Stress | P2A but skip trades during IPES-detected stress |
 | P_DIR | Directional | Cascade Fade | Directional bet on perp recovery after overshooting |
 | **P_MOM** | **Always-on** | **Momentum + IPES** | **Trend-follow BTC; IPES throttles risk in stressed regimes** |
+| P_MOM_A | Ablation | P_MOM + 200d SMA | Trend-filter gate — only long above long-run SMA |
+| P_MOM_C | Ablation | P_MOM + vol target | Scale leverage by inverse 30d realized vol (target 40% ann) |
+| P_MOM_D | Ablation | P_MOM + DD breaker | Halve leverage at −10% DD; flatten at −20% |
+| P_MOM_F | Ablation | P_MOM − IPES | IPES red-gate removed; isolates its marginal value |
 | **P_CARRY** | **Always-on** | **Carry + IPES** | **Earn funding rate; IPES shields against cascade losses** |
 
 """
@@ -112,25 +185,35 @@ Instead of using it as a trade signal, we use it to modulate risk across strateg
 
 # ── Main pipeline ───────────────────────────────────────────────────────────
 
-def main():
+def main(args: argparse.Namespace | None = None):
+    if args is None:
+        args = _parse_args()
+
     RESULTS_FILE = _next_results_file()
     out = StringIO()
 
+    mode_tag = "full"
+    if args.no_vecm:
+        mode_tag = "no-vecm (stub signals)"
+    elif args.fast:
+        mode_tag = "fast (Part 1 only)"
+
     out.write("# Results — BTC IPES Regime-Filtered Trading System\n\n")
-    out.write(f"Generated: {pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M UTC')}\n\n")
+    out.write(f"Generated: {pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M UTC')}\n")
+    out.write(f"Mode: **{mode_tag}**\n\n")
     out.write("IPES as a real-time market quality filter for always-on BTC strategies.\n")
-    out.write("1-minute full year 2024 + 1-second cascade deep-dives.\n\n")
+    out.write("1-minute multi-year backtest + 1-second cascade deep-dives.\n\n")
 
     out.write(STRATEGY_OVERVIEW)
     out.write("---\n")
 
     # ══════════════════════════════════════════════════════════════════
-    # PART 1: FULL-YEAR BACKTEST (1-minute data, always-on strategies)
+    # PART 1: MULTI-YEAR BACKTEST (1-minute data, always-on strategies)
     # ══════════════════════════════════════════════════════════════════
-    out.write(section("Part 1: Full-Year Backtest (1-Minute, 2024)"))
+    out.write(section("Part 1: Multi-Year Backtest (1-Minute)"))
 
     print("=" * 60)
-    print("  PART 1: Full-Year 1-Minute Backtest")
+    print("  PART 1: Multi-Year 1-Minute Backtest")
     print("=" * 60)
 
     print("Loading 1m BTC data...")
@@ -164,22 +247,24 @@ def main():
     basis_1m = spot_1m - perp_1m
     out.write(f"**Basis:** mean={basis_1m.mean():+.2f}, std={basis_1m.std():.2f}, "
               f"min={basis_1m.min():+.2f}, max={basis_1m.max():+.2f}\n")
-    out.write(f"**BTC Price:** {spot_1m.iloc[0]:.0f} (Jan 1) → "
-              f"{spot_1m.iloc[-1]:.0f} (Dec 31) "
+    first_date = spot_1m.index[0].strftime('%Y-%m-%d')
+    last_date = spot_1m.index[-1].strftime('%Y-%m-%d')
+    out.write(f"**BTC Price:** {spot_1m.iloc[0]:.0f} ({first_date}) → "
+              f"{spot_1m.iloc[-1]:.0f} ({last_date}) "
               f"({(spot_1m.iloc[-1]/spot_1m.iloc[0]-1)*100:+.1f}%)\n\n")
 
-    # Full-year analysis windows
-    fy_windows = [
-        {"name": "H1 2024 (Jan-Jun)",
-         "start": "2024-01-01", "end": "2024-06-30 23:59:59",
-         "role": "train"},
-        {"name": "H2 2024 (Jul-Dec)",
-         "start": "2024-07-01", "end": "2024-12-31 23:59:59",
-         "role": "test"},
-        {"name": "Full Year 2024",
-         "start": "2024-01-01", "end": "2024-12-31 23:59:59",
-         "role": "reference"},
-    ]
+    # Dynamic year detection — build windows from available data
+    first_year = spot_1m.index[0].year
+    last_year = spot_1m.index[-1].year
+
+    fy_windows = []
+    for y in range(first_year, last_year + 1):
+        fy_windows.append({"name": f"H1 {y} (Jan-Jun)", "start": f"{y}-01-01",
+                           "end": f"{y}-06-30 23:59:59", "role": "train"})
+        fy_windows.append({"name": f"H2 {y} (Jul-Dec)", "start": f"{y}-07-01",
+                           "end": f"{y}-12-31 23:59:59", "role": "test"})
+        fy_windows.append({"name": f"Full Year {y}", "start": f"{y}-01-01",
+                           "end": f"{y}-12-31 23:59:59", "role": "reference"})
 
     primary_params_1m = dict(
         interval="1m",
@@ -217,9 +302,24 @@ def main():
 
         print(f"\n  {wname}: {len(c1):,} obs")
         t0 = time.time()
-        rolling, portfolios, metrics = run_full_pipeline(
-            c1, c2, **primary_params_1m, verbose=False,
-        )
+        if args.no_vecm:
+            stub_signals = _build_stub_signals(c1, c2, interval="1m")
+            portfolios = run_all_portfolios(
+                stub_signals,
+                E_threshold=primary_params_1m["E_threshold"],
+                tx_cost_bps=primary_params_1m["tx_cost_bps"],
+            )
+            metrics = results_table(portfolios)
+            rolling = type("StubRolling", (), {
+                "signals": stub_signals,
+                "params": {"W": primary_params_1m["W"], "step": 15,
+                           "interval": "1m", "stub": True},
+                "to_dataframe": lambda self=None: pd.DataFrame(),
+            })()
+        else:
+            rolling, portfolios, metrics = run_full_pipeline(
+                c1, c2, **primary_params_1m, verbose=False,
+            )
         elapsed = time.time() - t0
 
         out.write(f"Observations: {len(c1):,} | "
@@ -244,9 +344,10 @@ def main():
                     out.write("\n")
             out.write("\n")
 
-            # Trade log for key strategies
+            # Trade log for key strategies (full-year reference windows only)
             for p in portfolios:
-                if 0 < p.n_trades <= 20 and p.name in ("P_MOM", "P_CARRY", "P_DIR"):
+                if (0 < p.n_trades <= 20 and p.name in ("P_MOM", "P_CARRY", "P_DIR")
+                        and w["role"] == "reference"):
                     out.write(f"**{p.name} Trade Log (first 10):**\n\n")
                     out.write(f"| Entry | Exit | PnL (gross) | PnL (net) | Entry Reason | Exit Reason |\n")
                     out.write(f"|-------|------|-------------|-----------|--------------|-------------|\n")
@@ -263,170 +364,199 @@ def main():
         fy_rolling[wname] = rolling
 
     # ══════════════════════════════════════════════════════════════════
-    # WALK-FORWARD VALIDATION: Train on H1, test on H2
+    # WALK-FORWARD VALIDATION: Multi-year rolling
     # ══════════════════════════════════════════════════════════════════
-    h1_key = "H1 2024 (Jan-Jun)"
-    h2_key = "H2 2024 (Jul-Dec)"
 
-    if h1_key in fy_signals and h2_key in fy_signals:
-        out.write(section("Walk-Forward Validation (Train H1 → Test H2)"))
-        out.write("Parameters selected on H1, frozen, then tested on H2. "
-                  "This is the honest out-of-sample test.\n\n")
+    def classify_regime(start, end):
+        """Classify a period's market regime from spot price data."""
+        s = spot_1m.loc[start:end]
+        if len(s) < 2:
+            return "N/A"
+        ret = s.iloc[-1] / s.iloc[0] - 1
+        cummax = s.cummax()
+        max_dd = ((s - cummax) / cummax).min()
+        if max_dd < -0.30:
+            return "Crash"
+        elif ret > 0.20:
+            return "Bull"
+        elif ret < -0.20:
+            return "Bear"
+        else:
+            return "Sideways"
 
-        h1_sigs = fy_signals[h1_key]
-        h2_sigs = fy_signals[h2_key]
+    def select_best(sweep_df):
+        """Select best config: Sharpe > 0 first, then highest return."""
+        viable = sweep_df[sweep_df["sharpe"] > 0]
+        if len(viable) > 0:
+            return viable.loc[viable["total_return"].idxmax()]
+        return sweep_df.loc[sweep_df["total_return"].idxmax()]
+
+    # Build walk-forward pairs
+    wf_pairs = []
+
+    # Within-year: H1 → H2 for each year
+    for y in range(first_year, last_year + 1):
+        h1_key = f"H1 {y} (Jan-Jun)"
+        h2_key = f"H2 {y} (Jul-Dec)"
+        if h1_key in fy_signals and h2_key in fy_signals:
+            wf_pairs.append((h1_key, h2_key))
+
+    # Cross-year: Full Year N → Full Year N+1
+    for y in range(first_year, last_year):
+        fy_key = f"Full Year {y}"
+        fy_next = f"Full Year {y + 1}"
+        if fy_key in fy_signals and fy_next in fy_signals:
+            wf_pairs.append((fy_key, fy_next))
+
+    if wf_pairs:
+        out.write(section("Walk-Forward Validation (Multi-Year Rolling)"))
+        out.write("Parameters swept on train period, frozen, tested out-of-sample. "
+                  "Within-year (H1→H2) and cross-year (Year N→Year N+1).\n\n")
 
         print("\n" + "=" * 60)
-        print("  WALK-FORWARD VALIDATION")
+        print("  WALK-FORWARD VALIDATION (Multi-Year)")
         print("=" * 60)
 
-        # ── P_MOM walk-forward ──────────────────────────────────────
-        print("\n  P_MOM parameter sweep on H1...")
-        h1_mom = p_mom_sweep(h1_sigs, tx_cost_bps=primary_params_1m["tx_cost_bps"],
-                             verbose=True)
+        tx = primary_params_1m["tx_cost_bps"]
+        wf_summary = []
 
-        # Select best: Sharpe > 0, then highest total_return
-        viable_mom = h1_mom[h1_mom["sharpe"] > 0]
-        if len(viable_mom) > 0:
-            best_mom = viable_mom.loc[viable_mom["total_return"].idxmax()]
-        else:
-            best_mom = h1_mom.loc[h1_mom["total_return"].idxmax()]
+        for train_key, test_key in wf_pairs:
+            train_sigs = fy_signals[train_key]
+            test_sigs = fy_signals[test_key]
 
-        sel_mom = {
-            "ema_periods": int(best_mom["ema_periods"]),
-            "E_threshold_red": float(best_mom["E_threshold_red"]),
-            "dp_red_threshold": float(best_mom["dp_red_threshold"]),
-            "ema_band_pct": float(best_mom["ema_band_pct"]),
-        }
+            # Get test period for regime classification
+            test_w = next(w for w in fy_windows if w["name"] == test_key)
+            regime = classify_regime(test_w["start"], test_w["end"])
 
-        out.write(section("P_MOM Walk-Forward", level=3))
-        out.write(f"**H1 sweep:** {len(h1_mom)} configs, "
-                  f"{(h1_mom['sharpe'] > 0).sum()} with Sharpe > 0\n\n")
-        out.write(f"**Selected params (from H1):** {sel_mom}\n")
-        out.write(f"**H1 performance:** return={best_mom['total_return']:.2%}, "
-                  f"sharpe={best_mom['sharpe']:.2f}, "
-                  f"trades={int(best_mom['n_trades'])}\n\n")
+            print(f"\n  {train_key} → {test_key} ({regime})")
+            row = {"train": train_key, "test": test_key, "regime": regime}
 
-        # Test on H2
-        h2_mom_wf = backtest_p_mom(h2_sigs, **sel_mom,
-                                    tx_cost_bps=primary_params_1m["tx_cost_bps"])
-        h2_mom_default = backtest_p_mom(h2_sigs,
-                                         tx_cost_bps=primary_params_1m["tx_cost_bps"])
-        wf_m = h2_mom_wf.metrics()
-        df_m = h2_mom_default.metrics()
+            # P_MOM sweep + test
+            print(f"    P_MOM sweep...")
+            h1_mom = p_mom_sweep(train_sigs, tx_cost_bps=tx, verbose=False)
+            best = select_best(h1_mom)
+            sel = {"ema_periods": int(best["ema_periods"]),
+                   "E_threshold_red": float(best["E_threshold_red"]),
+                   "dp_red_threshold": float(best["dp_red_threshold"]),
+                   "ema_band_pct": float(best["ema_band_pct"])}
+            wf_m = backtest_p_mom(test_sigs, **sel, tx_cost_bps=tx).metrics()
+            df_m = backtest_p_mom(test_sigs, tx_cost_bps=tx).metrics()
+            row["mom_wf_ret"] = wf_m["total_return"]
+            row["mom_wf_sharpe"] = wf_m["sharpe"]
+            row["mom_def_ret"] = df_m["total_return"]
+            row["mom_def_sharpe"] = df_m["sharpe"]
+            row["mom_sweep_pos"] = f"{(h1_mom['sharpe'] > 0).sum()}/{len(h1_mom)}"
 
-        out.write("**H2 out-of-sample comparison:**\n\n")
-        out.write("| Config | Return | Sharpe | Max DD | Trades | Breakeven TC |\n")
-        out.write("|--------|--------|--------|--------|--------|--------------|\n")
-        out.write(f"| H1-selected | {wf_m['total_return']:.2%} | "
-                  f"{wf_m['sharpe']:.2f} | {wf_m['max_drawdown']:.2%} | "
-                  f"{wf_m['n_trades']} | {wf_m['breakeven_tc_bps']:.1f} |\n")
-        out.write(f"| Hardcoded defaults | {df_m['total_return']:.2%} | "
-                  f"{df_m['sharpe']:.2f} | {df_m['max_drawdown']:.2%} | "
-                  f"{df_m['n_trades']} | {df_m['breakeven_tc_bps']:.1f} |\n\n")
+            # P_CARRY sweep + test
+            print(f"    P_CARRY sweep...")
+            h1_carry = p_carry_sweep(train_sigs, tx_cost_bps=tx, verbose=False)
+            best = select_best(h1_carry)
+            sel = {"E_threshold": float(best["E_threshold"]),
+                   "d_sum_threshold": float(best["d_sum_threshold"]),
+                   "reentry_cooldown": int(best["reentry_cooldown"])}
+            wf_c = backtest_p_carry(test_sigs, **sel, tx_cost_bps=tx).metrics()
+            df_c = backtest_p_carry(test_sigs, tx_cost_bps=tx).metrics()
+            row["carry_wf_ret"] = wf_c["total_return"]
+            row["carry_wf_sharpe"] = wf_c["sharpe"]
+            row["carry_def_ret"] = df_c["total_return"]
+            row["carry_def_sharpe"] = df_c["sharpe"]
 
-        # Parameter sensitivity by ema_periods
-        out.write("**Parameter sensitivity (H1, grouped by ema_periods):**\n\n")
-        out.write("| ema_periods | Mean Return | Std Return | Sharpe>0 frac | Mean Trades |\n")
-        out.write("|-------------|-------------|------------|---------------|-------------|\n")
-        for ep in sorted(h1_mom["ema_periods"].unique()):
-            subset = h1_mom[h1_mom["ema_periods"] == ep]
-            out.write(f"| {ep} | {subset['total_return'].mean():.2%} | "
-                      f"{subset['total_return'].std():.2%} | "
-                      f"{(subset['sharpe'] > 0).mean():.0%} | "
-                      f"{subset['n_trades'].mean():.0f} |\n")
+            # P_DIR sweep + test
+            print(f"    P_DIR sweep...")
+            h1_dir = p_dir_sweep(train_sigs, tx_cost_bps=tx, verbose=False)
+            best = select_best(h1_dir)
+            sel = {"dp_threshold": float(best["dp_threshold"]),
+                   "stop_loss_pct": float(best["stop_loss_pct"]),
+                   "trail_activation_pct": float(best["trail_activation_pct"]),
+                   "max_hold_signals": int(best["max_hold_signals"])}
+            wf_d = backtest_p_dir(test_sigs, **sel, tx_cost_bps=tx).metrics()
+            df_d = backtest_p_dir(test_sigs, tx_cost_bps=tx).metrics()
+            row["dir_wf_ret"] = wf_d["total_return"]
+            row["dir_wf_sharpe"] = wf_d["sharpe"]
+            row["dir_def_ret"] = df_d["total_return"]
+            row["dir_def_sharpe"] = df_d["sharpe"]
+
+            # P_MOM ablation variants on OOS test period (default params, no sweep)
+            print(f"    P_MOM variants...")
+            for key, fn in (("mom_a", backtest_p_mom_a),
+                            ("mom_c", backtest_p_mom_c),
+                            ("mom_d", backtest_p_mom_d),
+                            ("mom_f", backtest_p_mom_f)):
+                res = fn(test_sigs, tx_cost_bps=tx)
+                m = res.metrics()
+                row[f"{key}_n"] = res.n_trades
+                row[f"{key}_ret"] = m["total_return"]
+                row[f"{key}_sharpe"] = m["sharpe"]
+                row[f"{key}_dd"] = m["max_drawdown"]
+
+            wf_summary.append(row)
+
+        # ── Summary tables ──────────────────────────────────────────
+        out.write(section("P_MOM Walk-Forward Summary", level=3))
+        out.write("| Train | Test | Regime | WF Return | WF Sharpe "
+                  "| Default Return | Default Sharpe | Sweep Sharpe>0 |\n")
+        out.write("|-------|------|--------|-----------|-----------|"
+                  "----------------|----------------|----------------|\n")
+        for r in wf_summary:
+            out.write(f"| {r['train']} | {r['test']} | {r['regime']} | "
+                      f"{r['mom_wf_ret']:.2%} | {r['mom_wf_sharpe']:.2f} | "
+                      f"{r['mom_def_ret']:.2%} | {r['mom_def_sharpe']:.2f} | "
+                      f"{r['mom_sweep_pos']} |\n")
         out.write("\n")
 
-        # ── P_CARRY walk-forward ────────────────────────────────────
-        print("  P_CARRY parameter sweep on H1...")
-        h1_carry = p_carry_sweep(h1_sigs,
-                                  tx_cost_bps=primary_params_1m["tx_cost_bps"],
-                                  verbose=True)
+        out.write(section("P_CARRY Walk-Forward Summary", level=3))
+        out.write("| Train | Test | Regime | WF Return | WF Sharpe "
+                  "| Default Return | Default Sharpe |\n")
+        out.write("|-------|------|--------|-----------|-----------|"
+                  "----------------|----------------|\n")
+        for r in wf_summary:
+            out.write(f"| {r['train']} | {r['test']} | {r['regime']} | "
+                      f"{r['carry_wf_ret']:.2%} | {r['carry_wf_sharpe']:.2f} | "
+                      f"{r['carry_def_ret']:.2%} | {r['carry_def_sharpe']:.2f} |\n")
+        out.write("\n")
 
-        viable_carry = h1_carry[h1_carry["sharpe"] > 0]
-        if len(viable_carry) > 0:
-            best_carry = viable_carry.loc[viable_carry["total_return"].idxmax()]
-        else:
-            best_carry = h1_carry.loc[h1_carry["total_return"].idxmax()]
+        out.write(section("P_DIR Walk-Forward Summary", level=3))
+        out.write("| Train | Test | Regime | WF Return | WF Sharpe "
+                  "| Default Return | Default Sharpe |\n")
+        out.write("|-------|------|--------|-----------|-----------|"
+                  "----------------|----------------|\n")
+        for r in wf_summary:
+            out.write(f"| {r['train']} | {r['test']} | {r['regime']} | "
+                      f"{r['dir_wf_ret']:.2%} | {r['dir_wf_sharpe']:.2f} | "
+                      f"{r['dir_def_ret']:.2%} | {r['dir_def_sharpe']:.2f} |\n")
+        out.write("\n")
 
-        sel_carry = {
-            "E_threshold": float(best_carry["E_threshold"]),
-            "d_sum_threshold": float(best_carry["d_sum_threshold"]),
-            "reentry_cooldown": int(best_carry["reentry_cooldown"]),
-        }
-
-        out.write(section("P_CARRY Walk-Forward", level=3))
-        out.write(f"**H1 sweep:** {len(h1_carry)} configs, "
-                  f"{(h1_carry['sharpe'] > 0).sum()} with Sharpe > 0\n\n")
-        out.write(f"**Selected params (from H1):** {sel_carry}\n")
-        out.write(f"**H1 performance:** return={best_carry['total_return']:.2%}, "
-                  f"sharpe={best_carry['sharpe']:.2f}, "
-                  f"trades={int(best_carry['n_trades'])}\n\n")
-
-        h2_carry_wf = backtest_p_carry(h2_sigs, **sel_carry,
-                                        tx_cost_bps=primary_params_1m["tx_cost_bps"])
-        h2_carry_default = backtest_p_carry(h2_sigs,
-                                             tx_cost_bps=primary_params_1m["tx_cost_bps"])
-        wf_c = h2_carry_wf.metrics()
-        df_c = h2_carry_default.metrics()
-
-        out.write("**H2 out-of-sample comparison:**\n\n")
-        out.write("| Config | Return | Sharpe | Max DD | Trades | Breakeven TC |\n")
-        out.write("|--------|--------|--------|--------|--------|--------------|\n")
-        out.write(f"| H1-selected | {wf_c['total_return']:.2%} | "
-                  f"{wf_c['sharpe']:.2f} | {wf_c['max_drawdown']:.2%} | "
-                  f"{wf_c['n_trades']} | {wf_c['breakeven_tc_bps']:.1f} |\n")
-        out.write(f"| Hardcoded defaults | {df_c['total_return']:.2%} | "
-                  f"{df_c['sharpe']:.2f} | {df_c['max_drawdown']:.2%} | "
-                  f"{df_c['n_trades']} | {df_c['breakeven_tc_bps']:.1f} |\n\n")
-
-        # ── P_DIR walk-forward ──────────────────────────────────────
-        print("  P_DIR parameter sweep on H1...")
-        h1_dir = p_dir_sweep(h1_sigs,
-                              tx_cost_bps=primary_params_1m["tx_cost_bps"],
-                              verbose=True)
-
-        viable_dir = h1_dir[h1_dir["sharpe"] > 0]
-        if len(viable_dir) > 0:
-            best_dir = viable_dir.loc[viable_dir["total_return"].idxmax()]
-        else:
-            best_dir = h1_dir.loc[h1_dir["total_return"].idxmax()]
-
-        sel_dir = {
-            "dp_threshold": float(best_dir["dp_threshold"]),
-            "stop_loss_pct": float(best_dir["stop_loss_pct"]),
-            "trail_activation_pct": float(best_dir["trail_activation_pct"]),
-            "max_hold_signals": int(best_dir["max_hold_signals"]),
-        }
-
-        out.write(section("P_DIR Walk-Forward", level=3))
-        out.write(f"**H1 sweep:** {len(h1_dir)} configs, "
-                  f"{(h1_dir['sharpe'] > 0).sum()} with Sharpe > 0\n\n")
-        out.write(f"**Selected params (from H1):** {sel_dir}\n")
-        out.write(f"**H1 performance:** return={best_dir['total_return']:.2%}, "
-                  f"sharpe={best_dir['sharpe']:.2f}, "
-                  f"trades={int(best_dir['n_trades'])}\n\n")
-
-        h2_dir_wf = backtest_p_dir(h2_sigs, **sel_dir,
-                                    tx_cost_bps=primary_params_1m["tx_cost_bps"])
-        h2_dir_default = backtest_p_dir(h2_sigs,
-                                         tx_cost_bps=primary_params_1m["tx_cost_bps"])
-        wf_d = h2_dir_wf.metrics()
-        df_d = h2_dir_default.metrics()
-
-        out.write("**H2 out-of-sample comparison:**\n\n")
-        out.write("| Config | Return | Sharpe | Max DD | Trades | Breakeven TC |\n")
-        out.write("|--------|--------|--------|--------|--------|--------------|\n")
-        out.write(f"| H1-selected | {wf_d['total_return']:.2%} | "
-                  f"{wf_d['sharpe']:.2f} | {wf_d['max_drawdown']:.2%} | "
-                  f"{wf_d['n_trades']} | {wf_d['breakeven_tc_bps']:.1f} |\n")
-        out.write(f"| Hardcoded defaults | {df_d['total_return']:.2%} | "
-                  f"{df_d['sharpe']:.2f} | {df_d['max_drawdown']:.2%} | "
-                  f"{df_d['n_trades']} | {df_d['breakeven_tc_bps']:.1f} |\n\n")
+        # ── P_MOM ablation variant summaries (OOS, default params) ──
+        variant_info = [
+            ("P_MOM_A", "mom_a", "200-day SMA trend gate"),
+            ("P_MOM_C", "mom_c", "Vol-targeted leverage (40% ann, 30d lookback)"),
+            ("P_MOM_D", "mom_d", "Drawdown circuit breaker (−10% halve / −20% halt)"),
+            ("P_MOM_F", "mom_f", "IPES ablation — pure EMA crossover"),
+        ]
+        for title, key, desc in variant_info:
+            out.write(section(f"{title} Walk-Forward Summary", level=3))
+            out.write(f"*{desc}. Default params on OOS test period (no sweep).*\n\n")
+            out.write("| Train | Test | Regime | Trades | Return | Sharpe | Max DD |\n")
+            out.write("|-------|------|--------|--------|--------|--------|--------|\n")
+            for r in wf_summary:
+                out.write(f"| {r['train']} | {r['test']} | {r['regime']} | "
+                          f"{r[f'{key}_n']} | "
+                          f"{r[f'{key}_ret']:.2%} | "
+                          f"{r[f'{key}_sharpe']:.2f} | "
+                          f"{r[f'{key}_dd']:.2%} |\n")
+            out.write("\n")
 
     # ══════════════════════════════════════════════════════════════════
     # PART 2: CASCADE DEEP-DIVES (1-second data)
     # ══════════════════════════════════════════════════════════════════
+    if args.fast:
+        out.write("---\n\n")
+        out.write("> Generated by `python3 -m scripts.run_pipeline "
+                  f"{'--no-vecm' if args.no_vecm else '--fast'}`\n")
+        RESULTS_FILE.write_text(out.getvalue())
+        print(f"\n[{mode_tag}] Results written to {RESULTS_FILE}")
+        return
+
     out.write(section("Part 2: Cascade Deep-Dives (1-Second)"))
 
     print("\n" + "=" * 60)
@@ -645,4 +775,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(_parse_args())
